@@ -199,6 +199,51 @@ Cancellation/abort semantics in share:
 - The upload itself is not aborted mid-flight; cancellation is UI-level and
   checked after the upload returns.
 
+### Self-hosting the share server
+
+The hosted share server at `my.omp.sh` is not open source.
+[`packages/coding-agent/scripts/share-server.ts`](../packages/coding-agent/scripts/share-server.ts)
+implements the same contract on `Bun.serve`:
+
+- `POST /s` stores a sealed blob and returns `{"id": "<id>"}`.
+- `GET /s/<id>` serves the viewer page.
+- `GET /s/<id>/raw` serves the sealed blob.
+- `GET /healthz` returns `ok`.
+
+Like the hosted server, it never sees plaintext or keys: uploads are sealed client-side and the key stays in the link fragment.
+
+```sh
+# once, from a repository checkout after `bun install`; needs the native addon (packages/natives)
+bun packages/coding-agent/scripts/generate-share-viewer.ts /srv/omp/share-viewer.html
+# on the server; needs only Bun and this one script
+bun packages/coding-agent/scripts/share-server.ts \
+  --dir /srv/omp/shares --viewer /srv/omp/share-viewer.html --host 127.0.0.1 --port 7480
+```
+
+| Flag          | Default       | Meaning                                                           |
+| ------------- | ------------- | ----------------------------------------------------------------- |
+| `--dir`       | required      | Directory holding uploaded blobs, one file per share              |
+| `--viewer`    | required      | Viewer page from `generate-share-viewer.ts`                       |
+| `--port`      | `7480`        | Listen port                                                       |
+| `--host`      | all addresses | Bind address                                                      |
+| `--max-bytes` | `1000000`     | Upload cap; the client already trims snapshots to 1,000,000 bytes |
+
+Serve it over HTTPS (the viewer's WebCrypto needs a secure context off localhost) with the store mounted at `/s`: the viewer fetches `/s/<id>/raw` from its own origin. Then point clients at it:
+
+```yaml
+share:
+  serverUrl: https://omp-share.example.com/s
+  store: blob
+```
+
+The viewer page carries a Content-Security-Policy that confines scripts, fetches, images, and fonts to the server's origin, so it cannot reach third-party hosts. One consequence is that gist links (`share.store: gist`) do not render on a self-hosted viewer; keep `store: blob`.
+
+Limitations:
+
+- Anyone who can reach `POST /s` can upload; restrict access at the proxy or network layer.
+- Shares never expire; delete files from `--dir` to revoke them.
+- omp has no locked settings. A project's `.omp/config.yml` can override `share.serverUrl`, and an organization overlay through `PI_CONFIG_FILES` can still be changed by users who control their environment.
+
 ## New and delete
 
 Interactive `/new` starts a new conversation identity. The TUI first aborts any

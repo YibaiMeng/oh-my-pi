@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { DEFAULT_SHARE_MAX_BYTES, startShareServer } from "../scripts/share-server";
 import type { SessionData } from "../src/export/html";
 import {
 	buildShareSnapshot,
@@ -671,6 +673,62 @@ describe("shareSession", () => {
 			expect(JSON.stringify(opened)).toContain("share me");
 		} finally {
 			server.stop(true);
+		}
+	});
+});
+
+describe("share-server script", () => {
+	function startWithViewer(tempDir: TempDir, maxBytes?: number) {
+		const viewerHtmlPath = path.join(tempDir.path(), "viewer.html");
+		fs.writeFileSync(viewerHtmlPath, "<!doctype html><title>viewer</title>");
+		const dir = path.join(tempDir.path(), "blobs");
+		return { dir, server: startShareServer({ dir, viewerHtmlPath, maxBytes }) };
+	}
+
+	test("accepts shareSession uploads and serves them back at the printed link", async () => {
+		// The client trims snapshots to its cap; a smaller server cap would reject them.
+		expect(DEFAULT_SHARE_MAX_BYTES).toBe(SERVER_MAX_SEALED_BYTES);
+		using tempDir = TempDir.createSync("@omp-share-server-");
+		const { server } = startWithViewer(tempDir);
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => [messageEntry("e1", null, "self-hosted share")],
+			getLeafId: () => "e1",
+		} as unknown as SessionManager;
+		try {
+			const result = await shareSession(sm, { serverUrl: server.url });
+			const [link, keyText] = result.url.split("#");
+			// Pure-hex ids would send the viewer to GitHub gists.
+			expect(link).toMatch(/\/s\/(?![0-9a-f]+$)[A-Za-z0-9_-]{10,64}$/);
+
+			const viewer = await fetch(link);
+			expect(await viewer.text()).toContain("<title>viewer</title>");
+			expect(viewer.headers.get("content-security-policy")).toContain("connect-src 'self'");
+
+			const raw = await fetch(`${link}/raw`);
+			const key = await crypto.subtle.importKey("raw", Buffer.from(keyText, "base64url"), "AES-GCM", false, [
+				"decrypt",
+			]);
+			const opened = await open(key, new Uint8Array(await raw.arrayBuffer()));
+			expect(JSON.stringify(opened)).toContain("self-hosted share");
+
+			expect((await fetch(`${server.url}/MissingShare_123/raw`)).status).toBe(404);
+		} finally {
+			server.stop();
+		}
+	});
+
+	test("rejects empty and oversized uploads without storing them", async () => {
+		using tempDir = TempDir.createSync("@omp-share-server-cap-");
+		const { dir, server } = startWithViewer(tempDir, 8);
+		try {
+			const post = (bytes: number) => fetch(server.url, { method: "POST", body: new Uint8Array(bytes) });
+			expect((await post(9)).status).toBe(413);
+			expect((await post(0)).status).toBe(400);
+			expect(fs.readdirSync(dir)).toEqual([]);
+			expect((await post(8)).status).toBe(200);
+		} finally {
+			server.stop();
 		}
 	});
 });
